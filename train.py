@@ -1,23 +1,15 @@
 import time
 import numpy as np
 
-from typing import Callable, List, Union, Iterator
+import matplotlib.pyplot as plt
 
 import equinox as eqx
 import optax
 import jax
-import jax.lax as lax
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
-from jaxtyping import Array, Float
-import jax.tree_util as jtu
-
-import matplotlib.pyplot as plt
-
 jax.config.update("jax_enable_x64", True)
 
 from dataloader import DataLoader
-from utils import Args, save_model
 
 class Trainer():
     def __init__(self, system, 
@@ -27,18 +19,19 @@ class Trainer():
                        depth=2,
                        width=64,
                        dt=0.01, # For NeuralODEs, the time step for the ODE solver
-                       model_args=(),
+                       model_kwargs=(),
                        loss="L2",
                        lr=1e-4,
                        optim=None,
-                       schedule=None,
                        save_dir="/tmp/", 
-                       save_name="model_checkpoint"):
+                       save_name="model_checkpoint",
+                       seed=0):
         self.system = system
         if model_class is not None and model is None:
             if vector_field is None:
                 raise ValueError("If model_class is provided, vector_field must also be provided.")
-            model = model_class(vector_field, system.dim, width, depth, dt, *model_args)
+            key = jax.random.PRNGKey(seed)
+            model = model_class(vector_field, system.dim, width, depth, dt, key=key, **model_kwargs)
         elif model_class is None and model is not None:
             self.model = model
         else:
@@ -82,10 +75,12 @@ class Trainer():
         dataloader = DataLoader(ts, data)
         return dataloader
 
-    def train(self, N, N_valid, n_epochs, bs, bs_valid, mins, maxs, ts, dt, time_windows=None, nrand=None, save_every=100, seed=0, print_status=True):
+    def train(self, N, N_valid, n_epochs, bs, bs_valid, mins, maxs, ts_train, dt, time_windows=None, nrand=None, save_every=100, seed=0, print_status=True):
         make_step = eqx.filter_jit(self.make_step)
-        dl_train = self.create_dataloader(N, mins, maxs, ts, dt, seed=seed)
-        dl_valid = self.create_dataloader(N_valid, mins, maxs, ts, dt, seed=seed+1)
+        dl_train = self.create_dataloader(N, mins, maxs, ts_train, dt, seed=seed)
+        dl_valid = self.create_dataloader(N_valid, mins, maxs, ts_train, dt, seed=seed+1)
+
+        opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
 
         steps_per_epoch = int(N / bs)
         steps_valid = max([int(N_valid / bs_valid),1])
@@ -95,28 +90,38 @@ class Trainer():
         if time_windows is not None:
             if nrand is None:
                 nrand = [None] * N_time_schedules
-            schedule = zip(time_windows, nrand)
+            schedule = list(zip(time_windows, nrand))
 
         train_losses = []
         valid_losses = []
 
+        loader_key = jax.random.PRNGKey(seed)
+
         for epoch in range(n_epochs):
-            if print_status:
-                print("--------------------")
-                print(f"Epoch: {epoch}")
             index = epoch // (n_epochs // N_time_schedules)
             if epoch % (n_epochs // N_time_schedules) == 0 and index < N_time_schedules:
                 t_now, nrand_now = schedule[index]
-                n_t = round((t_now - ts[0]) / (ts[-1] - ts[0]) * len(ts))
+                n_t = round((t_now - ts_train[0]) / (ts_train[-1] - ts_train[0]) * (len(ts_train)-1))
                 if print_status:
-                    print(f"Training for time {t_now}, for {nrand_now} times")
+                    print("--------------------\n")
+                    print(f"Training until time {ts_train[n_t]}, with {nrand_now} samples.\n")
+            if print_status:
+                print("--------------------")
+                print(f"Epoch: {epoch}")
             train_loss_epoch = 0
             valid_loss_epoch = 0
             loader_key, train_loader_key = jax.random.split(loader_key)
-            for step, batch in zip(range(steps_per_epoch),dl_train(bs, key=train_loader_key,n1=n_t,nrand=nrand_now)):
+            for step, batch in zip(range(steps_per_epoch),dl_train(bs, key=train_loader_key,n1=n_t+1,nrand=nrand_now)):
                 start = time.time()
                 ts, yi = batch
-                loss, model, opt_state = make_step(ts, yi, model, opt_state)
+                print("Until time:", ts[-1])
+                print("ts shape:", ts.shape, "yi shape:", yi.shape)
+                print("Subset: ", jnp.isin(ts_train, ts, assume_unique=False).sum(), "of", len(ts), "time points")
+                plt.plot(ts, yi[0,:,0])
+                loss, self.model, opt_state = make_step(ts, yi, self.model, opt_state)
+                y_pred = jax.vmap(self.model, in_axes=(None, 0))(ts, yi[:,0,:])
+                plt.plot(ts, y_pred[0,:,0])
+                plt.show()
                 train_loss_epoch += loss
                 end = time.time()
             train_loss_epoch /= steps_per_epoch
@@ -132,11 +137,11 @@ class Trainer():
             if epoch % save_every == 0 and epoch > 0 and epoch < n_epochs-1:
                 if print_status: print(f"Saving model at epoch {epoch}")
                 checkpoint_name = self.save_dir+self.save_name+f"_{epoch}"
-                model.save_model(checkpoint_name)
+                self.model.save_model(checkpoint_name)
 
         if print_status: print("Training complete.")
         checkpoint_name = self.save_dir+self.save_name+"_final"
         if print_status: print(f"Saving model at {checkpoint_name}")
-        model.save_model(checkpoint_name)
+        self.model.save_model(checkpoint_name)
 
-        return model, train_losses, valid_losses
+        return self.model, train_losses, valid_losses

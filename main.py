@@ -5,9 +5,9 @@ from diffrax import diffeqsolve, Tsit5
 import jax
 import jax.numpy as jnp
 
-from models import NeuralODE, NeuralMetriplecticODE, GFINNODE
+from models import NeuralODE, MLPVectorField
 from system import SystemTrajectoryGenerator, MetriplecticSystem
-from train import train_loop
+from train import Trainer
 
 jax.config.update("jax_enable_x64", True)
 
@@ -80,25 +80,24 @@ c_hat = 1 # Energy normalization
 A_char = 1 # Average cross-sectional area
 args = (Nkb, m, alpha, length, c_hat, A_char)
 
+dim = 4
+system = MetriplecticSystem([L_gas,M_gas,E_gas,S_gas], dim, Tsit5(), ["q", "p", "S1", "S2"], args)
 
-system = MetriplecticSystem([L_gas,M_gas,E_gas,S_gas], 4, Tsit5(), ["q", "p", "S1", "S2"], args)
 
-model, train_losses, valid_losses = train_loop(system,
-            y0_mins=[0.2, -2, 1, 1], # TODO: Play around with these values
-            y0_maxs=[1.8, 2, 3, 3],
-            model_class=GFINNODE,
-            dataset_size=256,
-            batch_size=64,
-            n_epochs=10,
-            valid_size=128,
-            lr=3e-3,
-            width=32,
-            depth=5,
-            K=3,
-            t0=0.0,
-            dt=1e-3,
-            t1=[8.0], # This is approximate, the actual time will be given by the closest element in jnp.linspace(t0, max(t1), n_train)
-            t_val=10.0,
-            n_train=2000,
-            n_valid=50,
-            save_name="two_gas_container")
+key = jax.random.PRNGKey(42)
+model = NeuralODE(MLPVectorField, system.dim, 64, 2, 0.01, key=key)
+trainer = Trainer(system, model=model)
+model, train_losses, valid_losses = trainer.train(N=4, 
+                                                  N_valid=4, 
+                                                  n_epochs=10, 
+                                                  bs=2, 
+                                                  bs_valid=2, 
+                                                  mins=[0.2,-1,1,1], 
+                                                  maxs=[1.8,1,3,3], 
+                                                  ts_train=jnp.linspace(0, 10, 10000), 
+                                                  dt=1e-3,
+                                                  time_windows=[1, 10],
+                                                  nrand=[100, 200],
+                                                  save_every=100,
+                                                  seed=42,
+                                                  print_status=True)

@@ -1,21 +1,17 @@
 import time
 import numpy as np
 
-from typing import Callable, List, Union, Iterator
-
-import diffrax
-from diffrax import diffeqsolve, Tsit5, Kvaerno5, ODETerm, SaveAt, PIDController
+from diffrax import diffeqsolve, ODETerm, SaveAt, PIDController
 import equinox as eqx  # https://github.com/patrick-kidger/equinox
 import jax
 import jax.lax as lax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
-from jaxtyping import Array, Float  # https://github.com/google/jaxtyping
 
 jax.config.update("jax_enable_x64", True)
 
 class SystemTrajectoryGenerator():
-    def __init__(self, vector_field, dim, solver, variables, args, trainset_stats=None):
+    def __init__(self, vector_field, dim, solver, variables, args):
         self.vector_field = vector_field
         self.dim = dim
         self.solver = solver
@@ -69,3 +65,16 @@ class SystemTrajectoryGenerator():
         y0s = self.random_initial_conditions(N, jnp.array(mins), jnp.array(maxs), key)
         ts, training = self.generate_training_data(ts, y0s, dt)
         return ts,training
+    
+class MetriplecticSystem(SystemTrajectoryGenerator):
+    def __init__(self, metriplectic_form, dim, solver, variables, args):
+        self.L = lambda x: metriplectic_form[0](x, args)
+        self.M = lambda x: metriplectic_form[1](x, args)
+        self.E = lambda x: metriplectic_form[2](x, args)
+        self.S = lambda x: metriplectic_form[3](x, args)
+        self.F = lambda x: self.E(x) + self.S(x)
+        self.gradE = jax.grad(lambda x: self.E(x))
+        self.gradS = jax.grad(lambda x: self.S(x))
+        self.gradF = jax.grad(lambda x: self.F(x))
+        vector_field = lambda t, y, args: self.L(y) @ self.gradE(y) + self.M(y) @ self.gradS(y)
+        super().__init__(vector_field, dim, solver, variables, args)

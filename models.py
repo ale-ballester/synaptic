@@ -1,4 +1,3 @@
-from typing import Callable
 import json
 import diffrax
 import equinox as eqx
@@ -27,9 +26,15 @@ class MLPScalarField(eqx.Module):
 
 class MLPVectorField(eqx.Module):
     func: eqx.nn.MLP
+    dim: int
+    width: int
+    depth: int
 
     def __init__(self, dim, width, depth, *, key, **kwargs):
         super().__init__(**kwargs)
+        self.dim = dim
+        self.width = width
+        self.depth = depth
         self.func = eqx.nn.MLP(
             in_size=dim,
             out_size=dim,
@@ -45,10 +50,11 @@ class MLPVectorField(eqx.Module):
 class NeuralODE(eqx.Module):
     vector_field: eqx.Module
     dt: float
+    vf_kwargs: dict
 
     def __init__(self, vector_field_cls, dim, width, depth, dt, *, key, **kwargs):
         super().__init__(**kwargs)
-        self.vector_field = vector_field_cls(dim=dim, width=width, depth=depth, key=key, kwargs=kwargs)
+        self.vector_field = vector_field_cls(dim=dim, width=width, depth=depth, key=key, **kwargs)
         self.vf_kwargs = kwargs # Extra arguments for the vector field
         self.dt = dt
 
@@ -75,7 +81,7 @@ class NeuralODE(eqx.Module):
                 "dt": self.dt,
                 "kwargs": self.vf_kwargs,
             }
-            hyperparam_str = json.dumps(hyperparams.__dict__)
+            hyperparam_str = json.dumps(hyperparams)
             f.write((hyperparam_str + "\n").encode())
             eqx.tree_serialise_leaves(f, self)
     

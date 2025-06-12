@@ -4,8 +4,6 @@ import numpy as np
 import equinox as eqx
 import importlib
 
-from models import NeuralODE, NeuralMetriplecticODE, GFINNODE
-
 def _qualname(obj):
     """Return 'package.subpackage.module:ClassName'."""
     return f"{obj.__module__}:{obj.__qualname__}"
