@@ -64,7 +64,8 @@ class SystemTrajectoryGenerator():
         initial_conditions = jax.random.uniform(key, (n_samples,self.dim)) * (maxs - mins) + mins
         return initial_conditions
         
-    def trajectories_from_random_ics(self, n_samples, mins, maxs, ts, dt, key, save=False, save_name=None):
-        y0s = self.random_initial_conditions(n_samples, jnp.array(mins), jnp.array(maxs), key)
+    def trajectories_from_random_ics(self, N, mins, maxs, ts, dt, seed=0):
+        key = jax.random.PRNGKey(seed)
+        y0s = self.random_initial_conditions(N, jnp.array(mins), jnp.array(maxs), key)
         ts, training = self.generate_training_data(ts, y0s, dt)
         return ts,training

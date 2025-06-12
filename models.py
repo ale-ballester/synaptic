@@ -1,9 +1,12 @@
 from typing import Callable
+import json
 import diffrax
 import equinox as eqx
 import jax
 import jax.nn as jnn
 import jax.numpy as jnp
+
+from utils import _qualname, _resolve_qualname
 
 class MLPScalarField(eqx.Module):
     func: eqx.nn.MLP
@@ -43,9 +46,10 @@ class NeuralODE(eqx.Module):
     vector_field: eqx.Module
     dt: float
 
-    def __init__(self, vector_field, dim, width, depth, dt, *, key, **kwargs):
+    def __init__(self, vector_field_cls, dim, width, depth, dt, *, key, **kwargs):
         super().__init__(**kwargs)
-        self.vector_field = vector_field
+        self.vector_field = vector_field_cls(dim=dim, width=width, depth=depth, key=key, kwargs=kwargs)
+        self.vf_kwargs = kwargs # Extra arguments for the vector field
         self.dt = dt
 
     def __call__(self, ts, y0):
@@ -60,6 +64,29 @@ class NeuralODE(eqx.Module):
             saveat=diffrax.SaveAt(ts=ts),
         )
         return solution.ys
+    
+    def save_model(self, filename):
+        with open(filename, "wb") as f:
+            hyperparams = {
+                "vector_field_cls": _qualname(self.vector_field.__class__),
+                "dim": self.vector_field.dim,
+                "width": self.vector_field.width,
+                "depth": self.vector_field.depth,
+                "dt": self.dt,
+                "kwargs": self.vf_kwargs,
+            }
+            hyperparam_str = json.dumps(hyperparams.__dict__)
+            f.write((hyperparam_str + "\n").encode())
+            eqx.tree_serialise_leaves(f, self)
+    
+    @classmethod
+    def load_model(cls, filename):
+        def make_model(vector_field_cls, dim, width, depth, dt, key, kwargs):
+            return cls(vector_field_cls, dim, width, depth, dt, key=key, kwargs=kwargs)
+        with open(filename, "rb") as f:
+            hyperparams = json.loads(f.readline().decode())
+            model = make_model(key=jax.random.PRNGKey(0), **hyperparams)
+            return eqx.tree_deserialise_leaves(f, model)
 
 from jax.nn.initializers import glorot_uniform
 
