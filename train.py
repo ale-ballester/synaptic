@@ -23,7 +23,7 @@ class Trainer():
                        loss="L2",
                        lr=1e-4,
                        optim=None,
-                       save_dir="/tmp/", 
+                       save_dir="model/", 
                        save_name="model_checkpoint",
                        seed=0):
         self.system = system
@@ -75,7 +75,7 @@ class Trainer():
         dataloader = DataLoader(ts, data)
         return dataloader
 
-    def train(self, N, N_valid, n_epochs, bs, bs_valid, mins, maxs, ts_train, dt, time_windows=None, nrand=None, save_every=100, seed=0, print_status=True):
+    def train(self, N, N_valid, n_epochs, bs, bs_valid, mins, maxs, ts_train, dt, time_windows=None, nrand=None, save_every=100, seed=0, print_status=True, save_plots=False):
         make_step = eqx.filter_jit(self.make_step)
         dl_train = self.create_dataloader(N, mins, maxs, ts_train, dt, seed=seed)
         dl_valid = self.create_dataloader(N_valid, mins, maxs, ts_train, dt, seed=seed+1)
@@ -114,34 +114,48 @@ class Trainer():
             for step, batch in zip(range(steps_per_epoch),dl_train(bs, key=train_loader_key,n1=n_t+1,nrand=nrand_now)):
                 start = time.time()
                 ts, yi = batch
-                print("Until time:", ts[-1])
-                print("ts shape:", ts.shape, "yi shape:", yi.shape)
-                print("Subset: ", jnp.isin(ts_train, ts, assume_unique=False).sum(), "of", len(ts), "time points")
-                plt.plot(ts, yi[0,:,0])
                 loss, self.model, opt_state = make_step(ts, yi, self.model, opt_state)
                 y_pred = jax.vmap(self.model, in_axes=(None, 0))(ts, yi[:,0,:])
-                plt.plot(ts, y_pred[0,:,0])
-                plt.show()
                 train_loss_epoch += loss
                 end = time.time()
             train_loss_epoch /= steps_per_epoch
             train_losses.append(train_loss_epoch)
             loader_key, valid_loader_key = jax.random.split(loader_key)
-            for step, yi in zip(range(steps_valid),dl_valid(bs, key=train_loader_key)):
+            #for step, yi in zip(range(steps_valid),dl_valid(bs, key=train_loader_key)):
                 ### TODO: Implement validation loss function
                 #loss = val_loss(model, ts_valid, yi)
-                valid_loss_epoch += loss
-            valid_loss_epoch /= steps_valid
-            valid_losses.append(valid_loss_epoch)
+            #    valid_loss_epoch += loss
+            #valid_loss_epoch /= steps_valid
+            #valid_losses.append(valid_loss_epoch)
             if print_status: print(f"Train loss: {train_loss_epoch}, Valid loss: {valid_loss_epoch}")
             if epoch % save_every == 0 and epoch > 0 and epoch < n_epochs-1:
                 if print_status: print(f"Saving model at epoch {epoch}")
                 checkpoint_name = self.save_dir+self.save_name+f"_{epoch}"
                 self.model.save_model(checkpoint_name)
+                if save_plots:
+                    plt.figure(figsize=(10, 5))
+                    plt.plot(ts, yi[0,:,0], label='True Trajectory')
+                    plt.plot(ts, y_pred[0,:,0], label='Predicted Trajectory')
+                    plt.title(f'Epoch {epoch} - Training Loss: {loss:.4f}')
+                    plt.xlabel('Time')
+                    plt.ylabel('Value')
+                    plt.legend()
+                    plt.savefig(f"{self.save_dir}png/epoch_{epoch}_loss_{train_loss_epoch:.4f}.png")
+                    plt.close()
 
         if print_status: print("Training complete.")
         checkpoint_name = self.save_dir+self.save_name+"_final"
         if print_status: print(f"Saving model at {checkpoint_name}")
         self.model.save_model(checkpoint_name)
+        if save_plots:
+            plt.figure(figsize=(10, 5))
+            plt.plot(ts, yi[0,:,0], label='True Trajectory')
+            plt.plot(ts, y_pred[0,:,0], label='Predicted Trajectory')
+            plt.title(f'Epoch {epoch} - Training Loss: {loss:.4f}')
+            plt.xlabel('Time')
+            plt.ylabel('Value')
+            plt.legend()
+            plt.savefig(f"{self.save_dir}png/final_loss_{train_loss_epoch:.4f}.png")
+            plt.close()
 
         return self.model, train_losses, valid_losses
