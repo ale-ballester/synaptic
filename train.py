@@ -10,6 +10,7 @@ import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
 from dataloader import DataLoader
+from utils import make_dir
 
 class Trainer():
     def __init__(self, system, 
@@ -77,12 +78,19 @@ class Trainer():
 
     def train(self, N, N_valid, n_epochs, bs, bs_valid, mins, maxs, ts_train, dt, time_windows=None, nrand=None, save_every=100, seed=0, print_status=True, save_plots=False):
         make_step = eqx.filter_jit(self.make_step)
+
+        # TODO: Have some code to check that nrand and time_windows are compatible
+        # No time window should have more samples specified in nrand than the total number of samples in that time window
+
         dl_train = self.create_dataloader(N, mins, maxs, ts_train, dt, seed=seed)
         dl_valid = self.create_dataloader(N_valid, mins, maxs, ts_train, dt, seed=seed+1)
 
+        make_dir(self.save_dir)
+        make_dir(self.save_dir + "png")
+
         opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
 
-        steps_per_epoch = int(N / bs)
+        steps_per_epoch = max([int(N / bs),1])
         steps_valid = max([int(N_valid / bs_valid),1])
 
         N_time_schedules = len(time_windows) if time_windows is not None else 1
@@ -90,6 +98,8 @@ class Trainer():
         if time_windows is not None:
             if nrand is None:
                 nrand = [None] * N_time_schedules
+            elif len(nrand) != N_time_schedules:
+                raise ValueError("nrand must have the same length as time_windows.")
             schedule = list(zip(time_windows, nrand))
 
         train_losses = []
@@ -104,7 +114,7 @@ class Trainer():
                 n_t = round((t_now - ts_train[0]) / (ts_train[-1] - ts_train[0]) * (len(ts_train)-1))
                 if print_status:
                     print("--------------------\n")
-                    print(f"Training until time {ts_train[n_t]}, with {nrand_now} samples.\n")
+                    print(f"Training until time {ts_train[n_t]} ({n_t} total samples), with {nrand_now} samples.\n")
             if print_status:
                 print("--------------------")
                 print(f"Epoch: {epoch}")
@@ -133,29 +143,139 @@ class Trainer():
                 checkpoint_name = self.save_dir+self.save_name+f"_{epoch}"
                 self.model.save_model(checkpoint_name)
                 if save_plots:
-                    plt.figure(figsize=(10, 5))
-                    plt.plot(ts, yi[0,:,0], label='True Trajectory')
-                    plt.plot(ts, y_pred[0,:,0], label='Predicted Trajectory')
-                    plt.title(f'Epoch {epoch} - Training Loss: {loss:.4f}')
-                    plt.xlabel('Time')
-                    plt.ylabel('Value')
-                    plt.legend()
-                    plt.savefig(f"{self.save_dir}png/epoch_{epoch}_loss_{train_loss_epoch:.4f}.png")
-                    plt.close()
+                    self.plot_training(ts, yi, y_pred, epoch, train_loss_epoch)
 
         if print_status: print("Training complete.")
         checkpoint_name = self.save_dir+self.save_name+"_final"
         if print_status: print(f"Saving model at {checkpoint_name}")
         self.model.save_model(checkpoint_name)
         if save_plots:
-            plt.figure(figsize=(10, 5))
-            plt.plot(ts, yi[0,:,0], label='True Trajectory')
-            plt.plot(ts, y_pred[0,:,0], label='Predicted Trajectory')
-            plt.title(f'Epoch {epoch} - Training Loss: {loss:.4f}')
-            plt.xlabel('Time')
-            plt.ylabel('Value')
-            plt.legend()
-            plt.savefig(f"{self.save_dir}png/final_loss_{train_loss_epoch:.4f}.png")
-            plt.close()
+            self.plot_training(ts, yi, y_pred, "final", train_loss_epoch)
 
         return self.model, train_losses, valid_losses
+    
+    def plot_training(self, ts, yi, y_pred, epoch, train_loss_epoch, dims=None):
+        E_vals = eqx.filter_vmap(self.model.vector_field.energy)(y_pred[0])
+        S_vals = eqx.filter_vmap(self.model.vector_field.entropy)(y_pred[0])
+
+        # -------------------------------
+        # 2. Figure 1 – state trajectories
+        # -------------------------------
+        fig_states, ax_states = plt.subplots(figsize=(10, 5))
+
+        for i, var in enumerate(self.system.variables):
+            ax_states.plot(ts, yi[0, :, i],           label=f"True {var}")
+            ax_states.plot(ts, y_pred[0, :, i], "--", label=f"Predicted {var}")
+
+        ax_states.set_xlabel("Time")
+        ax_states.set_ylabel("State")
+        ax_states.grid(which="both")
+        ax_states.legend(loc="best")
+        fig_states.suptitle(f"Epoch {epoch} – Training Loss: {train_loss_epoch:.4f}")
+        fig_states.tight_layout()
+
+        fname_states = f"{self.save_dir}png/epoch_{epoch}_states_loss_{train_loss_epoch:.4f}.png"
+        fig_states.savefig(fname_states, dpi=150)
+        plt.close(fig_states)         # no display
+
+        # ----------------------------------------------
+        # 3. Figure 2 – energy (E) and entropy (S) traces
+        # ----------------------------------------------
+        fig_es, ax_es = plt.subplots(figsize=(10, 3))
+
+        ax_es.plot(ts, E_vals, "k-",  label="Energy E")
+        ax_es.plot(ts, S_vals, "r--", label="Entropy S")
+        ax_es.set_xlabel("Time")
+        ax_es.set_ylabel("Value")
+        ax_es.grid(which="both")
+        ax_es.legend(loc="best")
+        fig_es.suptitle(f"Epoch {epoch} – Energy & Entropy")
+        fig_es.tight_layout()
+
+        fname_es = f"{self.save_dir}png/epoch_{epoch}_ES_loss_{train_loss_epoch:.4f}.png"
+        fig_es.savefig(fname_es, dpi=150)
+        plt.close(fig_es)
+    
+    """
+    def generate_heatmap(grid_size, box, t_max, data_length, odeint, model, system, device, traj=False, vec=False):
+        # === Grid for initial conditions ===
+        x_vals = jnp.linspace(box[0,0], box[0,1], grid_size).to(device)
+        y_vals = jnp.linspace(box[1,0], box[1,1], grid_size).to(device)
+        X, Y = jnp.meshgrid(x_vals, y_vals, indexing='ij')
+
+        x0_flat = X.flatten()
+        y0_flat = Y.flatten()
+        z0 = jnp.stack([x0_flat, y0_flat], dim=1)  # shape (2500, 2)
+
+        # === Simulate ===
+        t_test = jnp.linspace(0., t_max, data_length).to(device)
+
+        true_y = system.generate_trajectories(y0s, t_test[0], t_test[-1], t_test[1]-t_test[0])  # (N, T, D)
+        pred_y = jax.vmap(model, in_axes=(None, 0))(t_test, y0s[:,:])     # (N, T, D)
+
+        # === Compute MSE per trajectory ===
+        squared_error = (pred_y - true_y)**2
+        mse_per_traj = squared_error.mean(dim=(1, 2))  # (N,)
+        mse_grid = mse_per_traj.reshape(grid_size, grid_size).cpu().numpy()
+
+        # === Plot heatmap ===
+        plt.figure(figsize=(7, 6))
+        plt.contourf(X.cpu(), Y.cpu(), mse_grid, levels=50, cmap='viridis')
+        plt.colorbar(label='Trajectory MSE')
+        plt.xlabel('$x_0$')
+        plt.ylabel('$y_0$')
+        plt.title('Prediction Error Heatmap with Trajectories')
+
+        if traj:
+            # === Overlay a few trajectories ===
+            indices = [
+                int(grid_size * grid_size * 0.5 + grid_size * 0.5),  # center
+                int(grid_size * grid_size * 0.2 + grid_size * 0.2),  # top-left
+                int(grid_size * grid_size * 0.8 + grid_size * 0.8),  # bottom-right
+                int(grid_size * grid_size * 0.2 + grid_size * 0.8),  # top-right
+                int(grid_size * grid_size * 0.8 + grid_size * 0.2),  # bottom-left
+            ]
+
+            colors = ['r', 'g', 'b', 'c', 'm']
+            counter = 0
+            for idx in indices:
+                # Extract trajectories
+                true_traj = true_y[:, idx, :].cpu().numpy()
+                pred_traj = pred_y[:, idx, :].cpu().numpy()
+
+                # Plot: solid = true, dashed = predicted
+                plt.plot(true_traj[:, 0], true_traj[:, 1], colors[counter]+'-', linewidth=1.5)
+                plt.plot(pred_traj[:, 0], pred_traj[:, 1], colors[counter]+'--', linewidth=1.5)
+                counter += 1
+
+            # === Finalize plot ===
+            from matplotlib.lines import Line2D
+
+            custom_lines = [Line2D([0], [0], color="black", ls="-", lw=1),
+                            Line2D([0], [0], color="black", ls="--", lw=1)]
+            plt.legend(custom_lines, ['True Trajectory', 'Predicted Trajectory'], loc='upper left')
+        if vec:
+            # === Compute vector field difference ===
+            vf_true = system(0, z0)       # shape (2500, 2)
+            vf_pred = model(0, z0)           # shape (2500, 2)
+
+            vf_diff = (vf_pred - vf_true).cpu().numpy()  # shape (2500, 2)
+            U = vf_diff[:, 0].reshape(grid_size, grid_size)
+            V = vf_diff[:, 1].reshape(grid_size, grid_size)
+
+            # Normalize for arrow direction only (optional)
+            mag = 1 #np.sqrt(U**2 + V**2) + 1e-8
+            U_norm = U / mag
+            V_norm = V / mag
+
+            # Plot vector field difference
+            plt.quiver(X.cpu(), Y.cpu(), U_norm, V_norm, angles='xy', scale_units='xy', scale=20, color='white', width=0.002)
+
+        # === Finalize plot ===
+        plt.xlim(box[0,0], box[0,1])
+        plt.ylim(box[1,0], box[1,1])
+        plt.tight_layout()
+        plt.show()
+
+        return X.cpu().numpy(), Y.cpu().numpy(), mse_grid
+    """

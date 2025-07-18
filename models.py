@@ -5,7 +5,7 @@ import jax
 import jax.nn as jnn
 import jax.numpy as jnp
 
-from utils import _qualname, _resolve_qualname
+from utils import _qualname, _resolve_qualname, xavier_uniform_reinit
 
 class MLPScalarField(eqx.Module):
     func: eqx.nn.MLP
@@ -94,24 +94,6 @@ class NeuralODE(eqx.Module):
             model = make_model(key=jax.random.PRNGKey(0), **hyperparams)
             return eqx.tree_deserialise_leaves(f, model)
 
-from jax.nn.initializers import glorot_uniform
-
-def xavier_uniform_reinit(model, *, key):
-    glorot = glorot_uniform()
-
-    leaves, treedef = jax.tree_util.tree_flatten(model)
-    keys_flat = jax.random.split(key, len(leaves))
-    keys_tree = jax.tree_util.tree_unflatten(treedef, keys_flat)
-
-    def _maybe_reinit(p, k):
-        if isinstance(p, jnp.ndarray) and p.ndim == 2:
-            return glorot(k, p.shape, p.dtype)
-        if isinstance(p, jnp.ndarray) and p.ndim == 1:
-            return jnp.zeros_like(p)
-        return p
-
-    return jax.tree_util.tree_map(_maybe_reinit, model, keys_tree)
-
 class GFINNComponent(eqx.Module):
     T: eqx.nn.MLP
     G: eqx.nn.MLP
@@ -119,6 +101,9 @@ class GFINNComponent(eqx.Module):
     dim: int = eqx.static_field()
     K: int = eqx.static_field()
     which_one: str = eqx.static_field()
+    T_dim: int = eqx.static_field()
+    triu_indices_T: jax.Array = eqx.static_field()
+    triu_indices_S: jax.Array = eqx.static_field()
 
     def __init__(self, dim, width, depth, K, which_one, *, key, **kwargs):
         super().__init__(**kwargs)
@@ -126,14 +111,16 @@ class GFINNComponent(eqx.Module):
         self.K = K
         self.which_one = which_one
         key1, key2, key3 = jax.random.split(key, num=3)
+        self.T_dim = K*(K-1) // 2 if which_one == "L" else K*(K+1) // 2
         self.T = eqx.nn.MLP(
             in_size=dim,
-            out_size=K**2,
+            out_size=self.T_dim,
             width_size=width,
             depth=depth,
             activation=jnn.tanh,
             key=key1,
         )
+        self.triu_indices_T = jnp.triu_indices(K, k=1) if which_one == "L" else jnp.triu_indices(K, k=0)
         key1, subkey1 = jax.random.split(key1)
         self.T = xavier_uniform_reinit(self.T, key=subkey1)
         self.G = eqx.nn.MLP(
@@ -147,10 +134,13 @@ class GFINNComponent(eqx.Module):
         )
         key2, subkey2 = jax.random.split(key2)
         self.G = xavier_uniform_reinit(self.G, key=subkey2)
-        self.S = 0.1*jax.random.normal(key=key3,shape=(self.K, self.dim, self.dim))
+        self.S = jax.random.normal(key=key3,shape=(self.K, self.dim*(self.dim-1)//2))
+        self.triu_indices_S = jnp.triu_indices(self.dim, k=1)
     
     def __call__(self, x):
-        T = self.T(x).reshape(self.K, self.K)
+        T = jnp.zeros((self.K, self.K))
+        T_vals = self.T(x)
+        T = T.at[self.triu_indices_T].set(T_vals)
         if self.which_one == "M":
             B = T@jnp.moveaxis(T,-1,-2)
         elif self.which_one == "L":
@@ -161,7 +151,8 @@ class GFINNComponent(eqx.Module):
         gradG1 = jnp.expand_dims(gradG,-2)
         Q = []
         for i in range(self.K):
-            S = jnp.triu(self.S[i], k=1)
+            S = jnp.zeros((self.dim, self.dim))
+            S = S.at[self.triu_indices_S].set(self.S[i])
             S = S - jnp.moveaxis(S,-1,-2)
             Q.append(gradG1@S)
         Q = jnp.concatenate(Q, axis=-2).squeeze()
@@ -178,11 +169,209 @@ class GFINN(MLPVectorField):
         key1, key2 = jax.random.split(key, num=2)
         self.LgradS = GFINNComponent(dim, width, depth, K, "L", key=key1)
         self.MgradE = GFINNComponent(dim, width, depth, K, "M", key=key2)
+        self.func = None
+    
+    def energy(self, x):
+        return self.MgradE.G(x)
+    
+    def entropy(self, x):
+        return self.LgradS.G(x)
     
     def __call__(self, t, x, args):
         L, dS = self.LgradS(x)
         M, dE = self.MgradE(x)
+        #dE = jnp.array([x[0], x[1], 1])
+        #L = jnp.array([[0, 1, 0], [-1, 0, 0], [0, 0, 0]])
+        #dS = jnp.array([0, 0, 1])
+        #M = jnp.array([[0, 0, 0], [0, 0, -2*0.2*1*x[1]], [0, -2*0.2*1*x[1], 2*0.2*1*x[1]**2]])
         dE = jnp.expand_dims(dE,1)
         dS = jnp.expand_dims(dS,1)
-        return -(dE @ L).squeeze() + (dS @ M).squeeze() 
+        return -(dE @ L).squeeze() + (dS @ M).squeeze()
 
+class BasicParam(MLPVectorField):
+    L: eqx.nn.MLP
+    M: eqx.nn.MLP
+    E: eqx.nn.MLP
+    S: eqx.nn.MLP
+    triu_indices_L: jax.Array = eqx.static_field()
+    triu_indices_M: jax.Array = eqx.static_field()
+
+    def __init__(self, dim, width, depth, *, key, **kwargs):
+        key, subkey = jax.random.split(key, num=2)
+        super().__init__(dim=dim, width=width, depth=depth, key=subkey, **kwargs)
+        key1, key2, key3, key4 = jax.random.split(key, num=4)
+        L_dim = dim * (dim - 1) // 2
+        self.L = eqx.nn.MLP(
+            in_size=dim,
+            out_size=L_dim,
+            width_size=width,
+            depth=depth,
+            activation=jnn.tanh,
+            key=key1,
+        )
+        M_dim = dim * (dim + 1) // 2
+        self.M = eqx.nn.MLP(
+            in_size=dim,
+            out_size=M_dim,
+            width_size=width,
+            depth=depth,
+            activation=jnn.tanh,
+            key=key2,
+        )
+
+        self.triu_indices_L = jnp.triu_indices(dim, k=1)
+        self.triu_indices_M = jnp.triu_indices(dim, k=0)
+        self.E = eqx.nn.MLP(
+            in_size=dim,
+            out_size=1,
+            width_size=width,
+            depth=depth,
+            activation=jnn.tanh,
+            key=key3,
+        )
+        self.S = eqx.nn.MLP(
+            in_size=dim,
+            out_size=1,
+            width_size=width,
+            depth=depth,
+            activation=jnn.tanh,
+            key=key3,
+        )
+        self.func = None
+    
+    def energy(self, x):
+        return self.E(x)
+    
+    def entropy(self, x):
+        return self.S(x)
+    
+    def __call__(self, t, x, args):
+        L_vals = self.L(x)
+        M_vals = self.M(x)
+        L = jnp.zeros((self.dim, self.dim))
+        L = L.at[self.triu_indices_L].set(L_vals)
+        L = L - L.T
+        M = jnp.zeros((self.dim, self.dim))
+        M = M.at[self.triu_indices_M].set(M_vals)
+        M = M.T@M
+        dE = jax.grad(lambda x: self.E(x).squeeze())(x).reshape([-1,self.dim])
+        dS = jax.grad(lambda x: self.S(x).squeeze())(x).reshape([-1,self.dim])
+        return -(dE @ L).squeeze() + (dS @ M).squeeze()
+
+class NMS(MLPVectorField):
+    dim: int
+    D: int
+    C2: int
+    poisson_A: eqx.Module
+    friction_C: eqx.Module
+    friction_B: eqx.Module
+    energy: eqx.Module
+    entropy: eqx.Module
+    poisson_A_idx: tuple
+
+    def __init__(self, dim, width, depth, *, lE, lS, lA, lB, lD, nE, nS, nA, nB, nD, D, C2, key, **kwargs):
+        k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+        super().__init__(dim=dim, width=0, depth=0, key=k5, **kwargs)
+
+        self.D = D
+        self.C2 = C2
+
+        self.poisson_A = eqx.nn.MLP(
+            in_size=dim,
+            out_size=dim * (dim - 1) // 2,
+            width_size=nA,
+            depth=lA,
+            use_final_bias=False,
+            activation=jnn.tanh,
+            key=k1,
+        )
+        self.poisson_A_idx = jnp.tril_indices(dim, -1)
+
+        self.friction_C = eqx.nn.MLP(
+            in_size=dim,
+            out_size=D*C2,
+            width_size=nD,
+            depth=lD,
+            use_final_bias=False,
+            activation=jnn.tanh,
+            key=k1,
+        )
+        self.friction_B = eqx.nn.MLP(
+            in_size=dim,
+            out_size=D*dim,
+            width_size=nB,
+            depth=lB,
+            use_final_bias=False,
+            activation=jnn.tanh,
+            key=k2,
+        )
+
+        self.energy = eqx.nn.MLP(
+            in_size=dim,
+            out_size=1,
+            width_size=nE,
+            depth=lE,
+            use_final_bias=False,
+            activation=jnn.tanh,
+            key=k3,
+        )
+        self.entropy = eqx.nn.MLP(
+            in_size=dim,
+            out_size=1,
+            width_size=nS,
+            depth=lS,
+            use_final_bias=False,
+            activation=jnn.tanh,
+            key=k4,
+        )
+
+    def poisson_product(self, y, dE, dS):
+        bdim = y.shape[0]
+        A_flat = self.poisson_A(y)
+        Amat = jnp.zeros((bdim, self.dim, self.dim))
+        Amat = Amat.at[:, self.poisson_A_idx[0], self.poisson_A_idx[1]].set(A_flat)
+        A = Amat - jnp.swapaxes(Amat, 1, 2)
+
+        AdE = jnp.einsum('bij,bj->bi', A, dE)
+        AdS = jnp.einsum('bij,bj->bi', A, dS)
+
+        dE_AdS = jnp.sum(dE * AdS, axis=-1, keepdims=True)
+        dE_dS = jnp.sum(dE * dS, axis=-1, keepdims=True)
+        dS_sq = jnp.sum(dS ** 2, axis=-1, keepdims=True)
+
+        correction = (dE_AdS * dS - dE_dS * AdS) / dS_sq
+        LdE = AdE + correction
+        return LdE
+
+    def friction_product(self, y, dE, dS):
+        bdim = y.shape[0]
+
+        C = self.friction_C(y).reshape(bdim, self.D, self.C2)
+        B = self.friction_B(y).reshape(bdim, self.D, self.dim)
+        Dmat = jnp.matmul(C, jnp.swapaxes(C, 1, 2))  # (bdim, D, D)
+
+        BdotdE = jnp.einsum('bij,bj->bi', B, dE)
+        BdotdS = jnp.einsum('bij,bj->bi', B, dS)
+        dE_sq = jnp.sum(dE ** 2, axis=-1, keepdims=True)
+
+        BdE = B - BdotdE[:, :, None] * dE[:, None, :] / dE_sq[:, None, :]
+
+        dEdS = jnp.sum(dE * dS, axis=-1, keepdims=True)
+        BdEdS = BdotdS - BdotdE * dEdS.squeeze(-1) / dE_sq.squeeze(-1)
+
+        MdS = jnp.einsum('bik,bkl,bi->bl', jnp.swapaxes(BdE, 1, 2), Dmat, BdEdS)
+        return MdS
+
+    def get_penalty(self, y, dE, dS):
+        LdS = self.poisson_product(y, dS, dS)
+        MdE = self.friction_product(y, dE, dE)
+        return LdS, MdE
+
+    def __call__(self, t, y):
+        dE = jax.vmap(jax.grad(lambda y_: self.energy(y_.reshape(1, -1)).sum()))(y)
+        dS = jax.vmap(jax.grad(lambda y_: self.entropy(y_.reshape(1, -1)).sum()))(y)
+
+        LdE = self.poisson_product(y, dE, dS)
+        MdS = self.friction_product(y, dE, dS)
+
+        return LdE + MdS
