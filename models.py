@@ -278,8 +278,8 @@ class NMS(MLPVectorField):
     poisson_A: eqx.Module
     friction_C: eqx.Module
     friction_B: eqx.Module
-    energy: eqx.Module
-    entropy: eqx.Module
+    E_MLP: eqx.Module
+    S_MLP: eqx.Module
     poisson_A_idx: tuple
 
     def __init__(self, dim, width, depth, *, lE, lS, lA, lB, lD, nE, nS, nA, nB, nD, D, C2, key, **kwargs):
@@ -321,7 +321,7 @@ class NMS(MLPVectorField):
             key=k3,
         )
 
-        self.energy = eqx.nn.MLP(
+        self.E_MLP = eqx.nn.MLP(
             in_size=dim,
             out_size=1,
             width_size=nE,
@@ -330,7 +330,7 @@ class NMS(MLPVectorField):
             activation=jnn.tanh,
             key=k4,
         )
-        self.entropy = eqx.nn.MLP(
+        self.S_MLP = eqx.nn.MLP(
             in_size=dim,
             out_size=1,
             width_size=nS,
@@ -394,12 +394,22 @@ class NMS(MLPVectorField):
         # MdS = sum_s alpha_s v_s  = V^T @ alpha
         MdS = V.T @ alpha                                     # (dim,)
         return MdS
+    
+    # Scalar energies per sample; grads in R^dim
+    def energy(self, x):   # x: (dim,)
+        return self.E_MLP(x).squeeze()
+    
+    def entropy(self, x):
+        return self.S_MLP(x).squeeze()
 
-    def get_penalty(self, y, dE, dS):
+    def get_penalty(self, y):
         """
         Degeneracy penalties (should be ~0 if constraints are satisfied):
           L∇S = 0 and M∇E = 0.
         """
+        dE = jax.grad(self.energy)(y)         # (dim,)
+        dS = jax.grad(self.entropy)(y)        # (dim,)
+        
         LdS = self.poisson_product(y, dS, dS)  # (dim,)
         MdE = self.friction_product(y, dE, dE) # (dim,)
         return LdS, MdE
@@ -408,14 +418,8 @@ class NMS(MLPVectorField):
         """
         y: (dim,) → returns (dim,)
         """
-        # Scalar energies per sample; grads in R^dim
-        def energy_scalar(x):   # x: (dim,)
-            return self.energy(x).squeeze()
-        def entropy_scalar(x):
-            return self.entropy(x).squeeze()
-
-        dE = jax.grad(energy_scalar)(y)         # (dim,)
-        dS = jax.grad(entropy_scalar)(y)        # (dim,)
+        dE = jax.grad(self.energy)(y)         # (dim,)
+        dS = jax.grad(self.entropy)(y)        # (dim,)
 
         LdE = self.poisson_product(y, dE, dS)   # (dim,)
         MdS = self.friction_product(y, dE, dS)  # (dim,)
