@@ -4,8 +4,9 @@ import equinox as eqx
 import jax
 import jax.nn as jnn
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 
-from utils import _qualname, _resolve_qualname, xavier_uniform_reinit
+from utils import _qualname, _resolve_qualname, xavier_uniform_reinit, _to_numpy
 
 class MLPScalarField(eqx.Module):
     func: eqx.nn.MLP
@@ -46,6 +47,203 @@ class MLPVectorField(eqx.Module):
 
     def __call__(self, t, y, args):
         return self.func(y)
+    
+    def plot(
+            self,
+            ranges,
+            *,
+            t: float = 0.0,
+            grid_size: int = 25,
+            vary: tuple = (0, 1),
+            fixed=None,
+            kind: str = "quiver",          # "quiver" or "stream"
+            stream_density: float = 1.2,
+            figsize=(6, 5),
+            quiver_scale=None,             # e.g., 50; None lets matplotlib choose
+            normalize: bool = True,        # normalize arrows for readability
+            title: str = None,
+        ):
+        """
+        Visualize the (unbatched) vector field f(t, y) implemented by self.vector_field.
+
+        Parameters
+        ----------
+        ranges : tuple
+            For dim == 1: (x_min, x_max)
+            For dim >= 2: ((x_min, x_max), (y_min, y_max)) for the two varying coordinates.
+            (Coordinates are chosen via `vary` when dim > 2.)
+        t : float
+            Time at which to evaluate the autonomous field; kept for generality.
+        grid_size : int
+            Number of points per axis.
+        vary : tuple(int, int)
+            Indices of the two coordinates to vary when dim >= 2.
+        fixed : dict or list[dict] or None
+            When dim > 2, specify values for the other coordinates.
+            - dict: one cross-section (e.g., {2: 0.0, 3: 1.0}).
+            - list of dict: multiple cross-sections -> creates subplots.
+            If None, all other coords are set to 0.0.
+        kind : {"quiver", "stream"}
+            Plot type for 2D slices.
+        stream_density : float
+            Density parameter for streamplot.
+        figsize : tuple
+            Figure size for a single plot. Multiple cross-sections scale rows.
+        quiver_scale : float or None
+            Matplotlib quiver scale; None lets matplotlib choose.
+        normalize : bool
+            If True, normalize vectors to unit length for readability (direction field).
+        title : str or None
+            Title for the plot(s).
+        """
+
+        dim = int(self.dim)
+
+        # Utility: evaluate f(t, y) over a set of points
+        def f_single(y):
+            return self.func(y)
+
+        # ---------- 1D ----------
+        if dim == 1:
+            x_min, x_max = ranges
+            xs = jnp.linspace(x_min, x_max, grid_size)
+            ys = jax.vmap(f_single)(xs)  # shape (grid_size,) since dim=1
+            xs_np = jnp.asarray(xs)
+            ys_np = jnp.asarray(ys)
+
+            fig, ax = plt.subplots(1, 1, figsize=figsize)
+            ax.plot(xs_np, ys_np, lw=1.5)
+            # arrows along the x-axis to show direction
+            if normalize:
+                mag = jnp.maximum(jnp.abs(ys_np), 1e-12)
+                u = jnp.sign(ys_np)  # direction only
+            else:
+                u = ys_np
+            ax.quiver(xs_np, jnp.zeros_like(xs_np), u, jnp.zeros_like(xs_np),
+                      angles='xy', scale_units='xy', scale=quiver_scale if quiver_scale else 1.0,
+                      width=0.003)
+            ax.axhline(0, color='k', lw=0.8, alpha=0.6)
+            ax.set_xlabel("y")
+            ax.set_ylabel("f(y)")
+            if title:
+                ax.set_title(title)
+            plt.show()
+            return
+
+        # ---------- 2D or higher ----------
+        (x_min, x_max), (y_min, y_max) = ranges
+        i, j = vary
+        assert 0 <= i < dim and 0 <= j < dim and i != j, "`vary` must be two distinct valid indices."
+
+        # Normalize `fixed` into a list of dicts (for multiple cross-sections)
+        if fixed is None:
+            fixed_list = [dict()]
+        elif isinstance(fixed, dict):
+            fixed_list = [fixed]
+        else:
+            # assume iterable of dicts
+            fixed_list = list(fixed)
+
+        # Fill missing fixed coordinates with zeros
+        def complete_fixed_dict(fd):
+            fd = dict(fd)  # copy
+            for k in range(dim):
+                if k not in (i, j) and k not in fd:
+                    fd[k] = 0.0
+            return fd
+
+        fixed_list = [complete_fixed_dict(fd) for fd in fixed_list]
+
+        # Build grid for the two varying coordinates
+        Xi = jnp.linspace(x_min, x_max, grid_size)
+        Xj = jnp.linspace(y_min, y_max, grid_size)
+        XI, XJ = jnp.meshgrid(Xi, Xj, indexing='xy')  # (G, G)
+
+        # Prepare figure
+        nplots = len(fixed_list)
+        nrows = nplots
+        figsize_total = (figsize[0], figsize[1] * nrows)
+        fig, axes = plt.subplots(nrows, 1, figsize=figsize_total, squeeze=False)
+        axes = axes[:, 0]
+
+        # For each cross-section, evaluate and plot
+        for ax, fd in zip(axes, fixed_list):
+            # Make full grid of y points: shape (G*G, dim)
+            def make_point(xi, xj):
+                y = jnp.zeros((dim,), dtype=XI.dtype)
+                y = y.at[i].set(xi)
+                y = y.at[j].set(xj)
+                # set fixed coords
+                for k, v in fd.items():
+                    if k != i and k != j:
+                        y = y.at[k].set(v)
+                return y
+
+            # Vectorized over grid
+            pts = jax.vmap(
+                lambda xi_row, xj_row: jax.vmap(make_point)(xi_row, xj_row)
+            )(XI, XJ)  # (G, G, dim)
+
+            # Flatten to (G*G, dim), evaluate, reshape back
+            pts_flat = pts.reshape((-1, dim))
+            f_out_flat = jax.vmap(f_single)(pts_flat)           # (G*G, dim)
+            f_out = f_out_flat.reshape((grid_size, grid_size, dim))
+
+            Ui = jnp.asarray(f_out[..., i])
+            Vj = jnp.asarray(f_out[..., j])
+            X = jnp.asarray(XI)
+            Y = jnp.asarray(XJ)
+
+            # optional: sanitize NaNs/Infs to avoid masked arrays being created
+            Ui_plot = jnp.nan_to_num(Ui, nan=0.0, posinf=0.0, neginf=0.0)
+            Vj_plot = jnp.nan_to_num(Vj, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # convert to NumPy for matplotlib
+            X = _to_numpy(XI)
+            Y = _to_numpy(XJ)
+            U = _to_numpy(Ui_plot)
+            V = _to_numpy(Vj_plot)
+
+            # (sometimes streamplot wants contiguous arrays)
+            #X = np.ascontiguousarray(X)
+            #Y = np.ascontiguousarray(Y)
+            #U = np.ascontiguousarray(U)
+            #V = np.ascontiguousarray(V)
+
+            if normalize:
+                mag = jnp.sqrt(Ui**2 + Vj**2)
+                mag = jnp.maximum(mag, 1e-12)
+                Ui_plot = Ui / mag
+                Vj_plot = Vj / mag
+            else:
+                Ui_plot, Vj_plot = Ui, Vj
+
+            if kind == "stream":
+                strm = ax.streamplot(
+                    X, Y, U, V,
+                    density=stream_density, linewidth=1.2, arrowsize=1.2
+                )
+            else:
+                ax.quiver(
+                    X, Y, U, V,
+                    angles='xy', scale_units='xy',
+                    scale=quiver_scale if quiver_scale else None, width=0.0025
+                )
+
+            ax.set_xlim(x_min, x_max)
+            ax.set_ylim(y_min, y_max)
+            ax.set_xlabel(f"y[{i}]")
+            ax.set_ylabel(f"y[{j}]")
+            fd_str = ", ".join([f"y[{k}]={v:g}" for k, v in sorted(fd.items()) if k not in (i, j)])
+            subtitle = f"Cross-section over (y[{i}], y[{j}])"
+            if fd_str:
+                subtitle += f" with {fd_str}"
+            ax.set_title(subtitle)
+
+        if title:
+            fig.suptitle(title, y=0.99)
+        fig.tight_layout()
+        plt.show()
 
 class NeuralODE(eqx.Module):
     vector_field: eqx.Module
@@ -87,11 +285,31 @@ class NeuralODE(eqx.Module):
     
     @classmethod
     def load_model(cls, filename):
-        def make_model(vector_field_cls, dim, width, depth, dt, key, kwargs):
-            return cls(vector_field_cls, dim, width, depth, dt, key=key, kwargs=kwargs)
         with open(filename, "rb") as f:
             hyperparams = json.loads(f.readline().decode())
-            model = make_model(key=jax.random.PRNGKey(0), **hyperparams)
+
+            # resolve class from saved string
+            vfc_path = hyperparams.pop("vector_field_cls")
+            vector_field_cls = _resolve_qualname(vfc_path)
+
+            dim   = hyperparams["dim"]
+            width = hyperparams["width"]
+            depth = hyperparams["depth"]
+            dt    = hyperparams["dt"]
+            vf_kwargs = hyperparams.get("kwargs", {})  # may be empty dict
+
+            # build skeleton with identical hyperparams
+            model = cls(
+                vector_field_cls=vector_field_cls,
+                dim=dim,
+                width=width,
+                depth=depth,
+                dt=dt,
+                key=jax.random.PRNGKey(0),
+                **vf_kwargs,                    # <- pass kwargs properly
+            )
+
+            # load parameters into that structure
             return eqx.tree_deserialise_leaves(f, model)
 
 """
@@ -155,17 +373,34 @@ class BasicParam(MLPVectorField):
     def entropy(self, x):
         return self.S(x)
     
-    def __call__(self, t, x, args):
+    def L(self, x):
         L_vals = self.L(x)
-        M_vals = self.M(x)
         L = jnp.zeros((self.dim, self.dim))
         L = L.at[self.triu_indices_L].set(L_vals)
-        L = L - L.T
+        return L - L.T
+    
+    def M(self, x):
+        M_vals = self.M(x)
         M = jnp.zeros((self.dim, self.dim))
         M = M.at[self.triu_indices_M].set(M_vals)
-        M = M.T@M
+        return M.T@M
+    
+    def get_terms(self, x):
+        L = self.L(x)
+        M = self.M(x)
         dE = jax.grad(lambda x: self.E(x).squeeze())(x).reshape([-1,self.dim])
         dS = jax.grad(lambda x: self.S(x).squeeze())(x).reshape([-1,self.dim])
+        return -(dE @ L).squeeze(),(dS @ M).squeeze(),dE,dS
+    
+    def get_penalty(self, x):
+        L = self.L(x)
+        M = self.M(x)
+        dE = jax.grad(lambda x: self.E(x).squeeze())(x).reshape([-1,self.dim])
+        dS = jax.grad(lambda x: self.S(x).squeeze())(x).reshape([-1,self.dim])
+        return -(dS @ L).squeeze(),(dE @ M).squeeze()
+    
+    def __call__(self, t, x, args):
+        L,M,dE,dS = self.metriplectic(x)
         return -(dE @ L).squeeze() + (dS @ M).squeeze()
 
 """
@@ -255,15 +490,30 @@ class GFINN(MLPVectorField):
     def entropy(self, x):
         return self.LgradS.G(x)
     
-    def __call__(self, t, x, args):
+    def L(self, x):
+        L, _ = self.LgradS(x)
+        return L
+
+    def M(self, x):
+        M, _ = self.MgradE(x)
+        return M
+    
+    def get_terms(self, x):
         L, dS = self.LgradS(x)
         M, dE = self.MgradE(x)
-        #dE = jnp.array([x[0], x[1], 1])
-        #L = jnp.array([[0, 1, 0], [-1, 0, 0], [0, 0, 0]])
-        #dS = jnp.array([0, 0, 1])
-        #M = jnp.array([[0, 0, 0], [0, 0, -2*0.2*1*x[1]], [0, -2*0.2*1*x[1], 2*0.2*1*x[1]**2]])
         dE = jnp.expand_dims(dE,1)
         dS = jnp.expand_dims(dS,1)
+        return -(dE @ L).squeeze(),(dS @ M).squeeze(),dE,dS
+    
+    def get_penalty(self, x):
+        L, dS = self.LgradS(x)
+        M, dE = self.MgradE(x)
+        dE = jnp.expand_dims(dE,1)
+        dS = jnp.expand_dims(dS,1)
+        return -(dS @ L).squeeze(),(dE @ M).squeeze()
+    
+    def __call__(self, t, x, args):
+        L, M, dE, dS = self.metriplectic(x)
         return -(dE @ L).squeeze() + (dS @ M).squeeze()
 
 """
@@ -401,6 +651,18 @@ class NMS(MLPVectorField):
     
     def entropy(self, x):
         return self.S_MLP(x).squeeze()
+    
+    def get_terms(self, y):
+        """
+        Returns the terms L, M, dE, dS for the metriplectic form.
+        Shapes: y ∈ R^dim → (L ∈ R^(dim, dim), M ∈ R^(dim, dim), dE ∈ R^dim, dS ∈ R^dim)
+        """
+        dE = jax.grad(self.energy)(y)         # (dim,)
+        dS = jax.grad(self.entropy)(y)        # (dim,)
+        
+        LdE = self.poisson_product(y, dE, dS)   # (dim,)
+        MdS = self.friction_product(y, dE, dS)  # (dim,)
+        return LdE, MdS, dE, dS
 
     def get_penalty(self, y):
         """
@@ -418,11 +680,7 @@ class NMS(MLPVectorField):
         """
         y: (dim,) → returns (dim,)
         """
-        dE = jax.grad(self.energy)(y)         # (dim,)
-        dS = jax.grad(self.entropy)(y)        # (dim,)
-
-        LdE = self.poisson_product(y, dE, dS)   # (dim,)
-        MdS = self.friction_product(y, dE, dS)  # (dim,)
+        LdE, MdS, _, _ = self.get_terms(y)  # (dim,), (dim,), (dim,), (dim,)
         return (LdE + MdS).squeeze()
 
 """
@@ -581,7 +839,7 @@ class FEMS(MLPVectorField):
     def free_energy(self,x):
         return jnp.squeeze(self.F_MLP(x))
     
-    def __call__(self, t, x, args):
+    def get_terms(self, x):
         if self.L_func is None:
             Q = self.Q_MLP(x)
             Sigma = self.Sigma_MLP(x)
@@ -598,6 +856,14 @@ class FEMS(MLPVectorField):
             gradF = jax.grad(self.free_energy, argnums=0)(x)
         else:
             gradF = jax.grad(lambda x: jnp.squeeze(self.F_func(x)), argnums=0)(x)
+        return L@gradF, M@gradF, gradF, gradF
+    
+    def get_penalty(self, x):
+        LdF,MdF,gradF,_ = self.get_terms(x)
+        return LdF, MdF
+    
+    def __call__(self, t, x, args):
+        L,M,gradF,_ = self.get_terms(x)
 
         #self.energy(x,U)
         #gradE = jax.grad(self.energy, argnums=0)(x, U)

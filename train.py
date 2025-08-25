@@ -51,7 +51,7 @@ class Trainer():
         self.save_dir = save_dir
         self.save_name = save_name
     
-    def L2_loss(self, model, ti, yi):
+    def L2_loss(self, model, ti, yi, alpha=0.0, beta=0.0, eps=1e-8):
         """
         Computes the L2 loss between the model predictions and the true values.
         Args:
@@ -63,6 +63,15 @@ class Trainer():
         """
         y_pred = jax.vmap(model, in_axes=(None, 0))(ti, yi[:,0,:])
         loss = ((yi - y_pred) ** 2).mean(axis=(1,2)).mean()
+        # loss = jnp.mean(jnp.mean(jnp.linalg.norm(y_pred - yi, axis=-1),axis=0),axis=0)
+
+        if alpha > 0.0 or beta > 0.0:
+            # Regularization term to avoid zero gradients for E and S
+            dE = jax.vmap(jax.vmap(jax.grad(model.vector_field.energy), in_axes=0), in_axes=0)(y_pred)
+            dS = jax.vmap(jax.vmap(jax.grad(model.vector_field.entropy), in_axes=0), in_axes=0)(y_pred)
+            nE = jnp.linalg.norm(dE, axis=-1)
+            nS = jnp.linalg.norm(dS, axis=-1)
+            loss += jnp.mean(-alpha*(jnp.log(nE+eps)+jnp.log(nS+eps)) + beta*(nE**2+nS**2))
         return loss
     
     def make_step(self, ti, yi, model, opt_state):
@@ -76,7 +85,7 @@ class Trainer():
         dataloader = DataLoader(ts, data)
         return dataloader
 
-    def train(self, N, N_valid, n_epochs, bs, bs_valid, mins, maxs, ts_train, dt, time_windows=None, nrand=None, save_every=100, seed=0, print_status=True, save_plots=False):
+    def train(self, N, N_valid, n_epochs, bs, bs_valid, mins, maxs, ts_train, dt, time_windows=None, nrand=None, save_every=100, seed=0, print_status=True, save_plots=False, diagnostics=False):
         make_step = eqx.filter_jit(self.make_step)
 
         # TODO: Have some code to check that nrand and time_windows are compatible
@@ -143,18 +152,18 @@ class Trainer():
                 checkpoint_name = self.save_dir+self.save_name+f"_{epoch}"
                 self.model.save_model(checkpoint_name)
                 if save_plots:
-                    self.plot_training(ts, yi, y_pred, epoch, train_loss_epoch)
+                    self.plot_training(ts, yi, y_pred, epoch, train_loss_epoch, diagnostics=diagnostics)
 
         if print_status: print("Training complete.")
         checkpoint_name = self.save_dir+self.save_name+"_final"
         if print_status: print(f"Saving model at {checkpoint_name}")
         self.model.save_model(checkpoint_name)
         if save_plots:
-            self.plot_training(ts, yi, y_pred, "final", train_loss_epoch)
+            self.plot_training(ts, yi, y_pred, "final", train_loss_epoch, diagnostics=diagnostics)
 
         return self.model, train_losses, valid_losses
     
-    def plot_training(self, ts, yi, y_pred, epoch, train_loss_epoch, dims=None):
+    def plot_training(self, ts, yi, y_pred, epoch, train_loss_epoch, dims=None, diagnostics=False):
         E_vals = eqx.filter_vmap(self.model.vector_field.energy)(y_pred[0])
         S_vals = eqx.filter_vmap(self.model.vector_field.entropy)(y_pred[0])
 
@@ -180,6 +189,7 @@ class Trainer():
 
         # ----------------------------------------------
         # 3. Figure 2 – energy (E) and entropy (S) traces
+        # WARNING: Depends on the model having energy and entropy methods (move elsewhere?)
         # ----------------------------------------------
         fig_es, ax_es = plt.subplots(figsize=(10, 3))
 
@@ -195,6 +205,47 @@ class Trainer():
         fname_es = f"{self.save_dir}png/epoch_{epoch}_ES_loss_{train_loss_epoch:.4f}.png"
         fig_es.savefig(fname_es, dpi=150)
         plt.close(fig_es)
+
+        # ----------------------------------------------
+        # 4. Figure 3 – Diagnostics (if applicable)
+        # WARNING: Depends on the model having energy and entropy methods (move elsewhere?)
+        # ----------------------------------------------
+        if diagnostics:
+            # Plot norms of nablaE, nablaS, LnablaE, LnablaS, MnablaE, MnablaS throughout state space
+            # Use methods get_terms and get_penalty from model.vector_field
+            LdE, MdS, dE, dS = eqx.filter_vmap(self.model.vector_field.get_terms)(y_pred[0])
+            LdS, MdE = eqx.filter_vmap(self.model.vector_field.get_penalty)(y_pred[0])
+
+            # Create a figure with two subplots
+            fig_diag, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+            # Plot the norms of the gradients
+            ax1.plot(ts, jnp.linalg.norm(dE, axis=1), label="||∇E||", color="blue")
+            ax1.plot(ts, jnp.linalg.norm(dS, axis=1), label="||∇S||", color="orange")
+            ax1.plot(ts, jnp.linalg.norm(LdE, axis=1), label="||L∇E||", color="green")
+            ax1.plot(ts, jnp.linalg.norm(MdS, axis=1), label="||M∇S||", color="red")
+            ax1.plot(ts, jnp.linalg.norm(LdE+MdS, axis=1), label="||L∇E + M∇S||", color="black")
+            ax1.set_xlabel("Time")
+            ax1.set_ylabel("Norm")
+            ax1.set_title("Norms of Gradients")
+            ax1.grid(which="both")
+            ax1.legend()
+
+            # Plot the norms of the L and M terms
+            ax2.plot(ts, jnp.linalg.norm(LdS, axis=1), label="||L∇E||", color="green")
+            ax2.plot(ts, jnp.linalg.norm(MdE, axis=1), label="||M∇S||", color="red")
+            ax2.set_xlabel("Time")
+            ax2.set_ylabel("Norm")
+            ax2.set_yscale("log")
+            ax2.set_title("Norms of L and M Terms")
+            ax2.grid(which="both")
+            ax2.legend()
+
+            fig_diag.suptitle(f"Epoch {epoch} - Diagnostics")
+            fig_diag.tight_layout()
+            fname_diag = f"{self.save_dir}png/epoch_{epoch}_diagnostics_loss_{train_loss_epoch:.4f}.png"
+            fig_diag.savefig(fname_diag, dpi=150)
+            plt.close(fig_diag)
+            
     
     """
     def generate_heatmap(grid_size, box, t_max, data_length, odeint, model, system, device, traj=False, vec=False):

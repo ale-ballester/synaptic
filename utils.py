@@ -40,3 +40,7 @@ def xavier_uniform_reinit(model, *, key):
         return p
 
     return jax.tree_util.tree_map(_maybe_reinit, model, keys_tree)
+
+def _to_numpy(x):
+    # move off device + ensure plain NumPy array (not masked, not jax array)
+    return np.asarray(jax.device_get(x))
