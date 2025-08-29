@@ -44,3 +44,6 @@ def xavier_uniform_reinit(model, *, key):
 def _to_numpy(x):
     # move off device + ensure plain NumPy array (not masked, not jax array)
     return np.asarray(jax.device_get(x))
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)

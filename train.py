@@ -43,6 +43,7 @@ class Trainer():
             self.loss = loss # Same signature as L2_loss, but different implementation
         self.grad_loss = eqx.filter_value_and_grad(self.loss)
         self.lr = lr
+        self.nobs = None # If not None, should be a slice or list of indices of observed variables
         if optim is None:
             self.optim = optax.adam(lr)
         else:
@@ -61,8 +62,9 @@ class Trainer():
         Returns:
             The L2 loss value.
         """
+        if self.nobs is None: self.nobs = slice(None, None, None)
         y_pred = jax.vmap(model, in_axes=(None, 0))(ti, yi[:,0,:])
-        loss = ((yi - y_pred) ** 2).mean(axis=(1,2)).mean()
+        loss = ((yi[:,:,self.nobs] - y_pred[:,:,self.nobs]) ** 2).mean(axis=(1,2)).mean()
         # loss = jnp.mean(jnp.mean(jnp.linalg.norm(y_pred - yi, axis=-1),axis=0),axis=0)
 
         if alpha > 0.0 or beta > 0.0:
@@ -82,14 +84,13 @@ class Trainer():
     
     def create_dataloader(self, N, mins, maxs, ts, dt, seed=0):
         ts, data = self.system.trajectories_from_random_ics(N, mins, maxs, ts, dt, seed=seed)
-        dataloader = DataLoader(ts, data)
+        dataloader = DataLoader(ts, data, nobs=self.nobs)
         return dataloader
 
-    def train(self, N, N_valid, n_epochs, bs, bs_valid, mins, maxs, ts_train, dt, time_windows=None, nrand=None, save_every=100, seed=0, print_status=True, save_plots=False, diagnostics=False):
+    def train(self, N, N_valid, n_epochs, bs, bs_valid, mins, maxs, ts_train, dt, time_windows=None, nrand=None, nobs=None, save_every=100, seed=0, print_status=True, save_plots=False, diagnostics=False):
         make_step = eqx.filter_jit(self.make_step)
 
-        # TODO: Have some code to check that nrand and time_windows are compatible
-        # No time window should have more samples specified in nrand than the total number of samples in that time window
+        self.nobs = nobs
 
         dl_train = self.create_dataloader(N, mins, maxs, ts_train, dt, seed=seed)
         dl_valid = self.create_dataloader(N_valid, mins, maxs, ts_train, dt, seed=seed+1)

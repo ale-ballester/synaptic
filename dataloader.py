@@ -2,10 +2,22 @@ import jax
 import jax.numpy as jnp
 
 class DataLoader:
-    def __init__(self, ts, data):
+    def __init__(self, ts, data, nobs=None):
         self.ts = ts
         self.data = data
         self.n_times = len(ts)
+        self.nobs = nobs
+        if nobs is not None:
+            dim = data.shape[-1]
+            self.data = self.data[:,:,nobs]
+            len_nobs = len(range(*nobs.indices(dim)))
+            nentropy = dim-len_nobs
+            if nentropy > 0:
+                print(f"DataLoader: Ignoring {nentropy} entropy dimensions.")
+                virtual_entropy = jnp.linspace(0, 1, self.n_times)
+                virtual_entropy = jnp.broadcast_to(virtual_entropy[None, :, None], (data.shape[0], self.n_times, nentropy))
+                self.data = jnp.concatenate([self.data, virtual_entropy], axis=-1)
+                print(f"DataLoader: Added {nentropy} virtual entropy dimensions.")
     
     def __call__(self, batch_size, key, ind_times=None, n0=None, n1=None, nskip=None, nobs=None, nrand=None):
         key_perm, key_times = jax.random.split(key, 2)
