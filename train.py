@@ -63,6 +63,7 @@ class Trainer():
             The L2 loss value.
         """
         if self.nobs is None: self.nobs = slice(None, None, None)
+        print("yi shape in loss: ", yi.shape)
         y_pred = jax.vmap(model, in_axes=(None, 0))(ti, yi[:,0,:])
         loss = ((yi[:,:,self.nobs] - y_pred[:,:,self.nobs]) ** 2).mean(axis=(1,2)).mean()
         # loss = jnp.mean(jnp.mean(jnp.linalg.norm(y_pred - yi, axis=-1),axis=0),axis=0)
@@ -237,7 +238,7 @@ class Trainer():
             ax2.set_xlabel("Time")
             ax2.set_ylabel("Norm")
             ax2.set_yscale("log")
-            ax2.set_title("Norms of L and M Terms")
+            ax2.set_title("Degeneracy Conditions")
             ax2.grid(which="both")
             ax2.legend()
 
