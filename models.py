@@ -728,7 +728,17 @@ class MLPMatrix(eqx.Module):
                             activation=jnn.tanh,
                             key=key,
                         )
-        elif self.symmetric or self.antisymmetric or self.unitary:
+        elif self.symmetric:
+            self.model = eqx.nn.MLP(
+                            in_size=n_in,
+                            out_size=int((n_in+1)*n_in/2),
+                            width_size=width,
+                            depth=depth,
+                            use_final_bias=False,
+                            activation=jnn.tanh,
+                            key=key,
+                        )
+        elif self.antisymmetric or self.unitary:
             self.model = eqx.nn.MLP(
                             in_size=n_in,
                             out_size=int((n_in-1)*n_in/2),
@@ -745,7 +755,7 @@ class MLPMatrix(eqx.Module):
             A = jnp.zeros((self.n_in,self.n_in))
             # Make diagonal elements positive (kills 0 elements!)
             #if self.psd: x = jax.nn.softplus(x)
-            if self.psd: x = x**2
+            if self.psd: x = jnp.abs(x)
             i_diag = jnp.pad(jnp.arange(self.n_in-self.kernel), (0, self.kernel))
             j_diag = jnp.pad(jnp.arange(self.n_in-self.kernel), (0, self.kernel))
             A = A.at[i_diag, j_diag].set(x)
@@ -863,7 +873,7 @@ class FEMS(MLPVectorField):
         return LdF, MdF
     
     def __call__(self, t, x, args):
-        L,M,gradF,_ = self.get_terms(x)
+        LdF,MdF,_,_ = self.get_terms(x)
 
         #self.energy(x,U)
         #gradE = jax.grad(self.energy, argnums=0)(x, U)
@@ -871,7 +881,7 @@ class FEMS(MLPVectorField):
 
         #poisson = L@gradE
         #metric = M@gradS
-        metriplectic = (L+M)@gradF #poisson + metric
+        metriplectic = LdF+MdF #poisson + metric
 
         #jax.debug.print("jax.debug.print(metriplectic) -> {x}", x=metriplectic)
 

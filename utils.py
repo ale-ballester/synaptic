@@ -46,4 +46,8 @@ def _to_numpy(x):
     return np.asarray(jax.device_get(x))
 
 def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # eqx.is_array marks any JAX array (trainable or not).
+    # eqx.is_inexact_array marks specifically inexact dtypes (float/complex),
+    # which are the ones you normally optimize.
+    leaves = jax.tree_leaves(eqx.filter(model, eqx.is_inexact_array))
+    return sum(jnp.size(leaf) for leaf in leaves)
